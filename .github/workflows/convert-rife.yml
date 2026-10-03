@@ -292,14 +292,34 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           cd out
           ls -lh
+
+          retry() {
+            local n=1
+            until "$@"; do
+              if [ "$n" -ge 6 ]; then
+                echo "Falló tras $n intentos: $*"
+                return 1
+              fi
+              echo "Intento $n falló (GitHub API intermitente). Reintentando en $((n * 15))s..."
+              sleep $((n * 15))
+              n=$((n + 1))
+            done
+          }
+
           gh release view rife-models --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
-            gh release create rife-models --repo "$GITHUB_REPOSITORY" \
+            retry gh release create rife-models --repo "$GITHUB_REPOSITORY" \
               --title "RIFE 4.25 Core ML" \
-              --notes "RIFE 4.25 convertido a Core ML (MIT, hzwer/Practical-RIFE)."
-          gh release upload rife-models --repo "$GITHUB_REPOSITORY" --clobber ./*.zip
+              --notes "RIFE 4.25 convertido a Core ML (MIT, hzwer/Practical-RIFE)." || exit 1
+
+          for z in ./*.zip; do
+            echo "Subiendo $z"
+            retry gh release upload rife-models --repo "$GITHUB_REPOSITORY" --clobber "$z" || exit 1
+          done
+          echo "Todos los modelos publicados."
+          gh release view rife-models --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'
 
       - name: Upload log and models as artifact
         if: always()
