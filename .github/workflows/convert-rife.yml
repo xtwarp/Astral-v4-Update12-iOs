@@ -1,0 +1,313 @@
+name: Convert RIFE 4.25 to Core ML
+
+on:
+  workflow_dispatch:
+    inputs:
+      sizes:
+        description: "Tamaños ANCHOxALTO separados por coma (múltiplos de 128)"
+        default: "1920x1152,1152x1920"
+
+permissions:
+  contents: write
+
+jobs:
+  convert:
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "numpy==1.26.4" "torch==2.5.1" "coremltools==8.3.0" huggingface_hub
+
+      - name: Download RIFE 4.25 weights (official mirror, MIT)
+        run: |
+          python - <<'PY'
+          import glob, os
+          from huggingface_hub import snapshot_download
+          d = snapshot_download("Upsampler/rife-4-25")
+          print("Archivos descargados:")
+          for root, _, files in os.walk(d):
+              for f in files:
+                  print(" ", os.path.join(root, f))
+          pk = glob.glob(os.path.join(d, "**", "*.pkl"), recursive=True)
+          assert pk, "No se encontro flownet.pkl en el mirror"
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write("WEIGHTS=" + pk[0] + "\n")
+          PY
+
+      - name: Write converter
+        run: |
+          cat > convert_rife.py <<'PYEOF'
+          import json
+          import os
+          import shutil
+          import sys
+          import time
+
+          import numpy as np
+          import torch
+          import torch.nn as nn
+          import torch.nn.functional as F
+          import coremltools as ct
+
+          print("torch", torch.__version__, "| coremltools", ct.__version__, "| numpy", np.__version__)
+
+
+          def cbr(i, o, k=3, s=1, p=1):
+              return nn.Sequential(nn.Conv2d(i, o, k, s, p, bias=True), nn.LeakyReLU(0.2))
+
+
+          class Head(nn.Module):
+              def __init__(self):
+                  super().__init__()
+                  self.cnn0 = nn.Conv2d(3, 16, 3, 2, 1)
+                  self.cnn1 = nn.Conv2d(16, 16, 3, 1, 1)
+                  self.cnn2 = nn.Conv2d(16, 16, 3, 1, 1)
+                  self.cnn3 = nn.ConvTranspose2d(16, 4, 4, 2, 1)
+                  self.relu = nn.LeakyReLU(0.2)
+
+              def forward(self, x):
+                  x = self.relu(self.cnn0(x))
+                  x = self.relu(self.cnn1(x))
+                  x = self.relu(self.cnn2(x))
+                  return self.cnn3(x)
+
+
+          class ResConv(nn.Module):
+              def __init__(self, c):
+                  super().__init__()
+                  self.conv = nn.Conv2d(c, c, 3, 1, 1)
+                  self.beta = nn.Parameter(torch.ones((1, c, 1, 1)))
+                  self.relu = nn.LeakyReLU(0.2)
+
+              def forward(self, x):
+                  return self.relu(self.conv(x) * self.beta + x)
+
+
+          class IFBlock(nn.Module):
+              def __init__(self, in_planes, c):
+                  super().__init__()
+                  self.conv0 = nn.Sequential(cbr(in_planes, c // 2, 3, 2, 1), cbr(c // 2, c, 3, 2, 1))
+                  self.convblock = nn.Sequential(*[ResConv(c) for _ in range(8)])
+                  self.lastconv = nn.Sequential(nn.ConvTranspose2d(c, 4 * 13, 4, 2, 1), nn.PixelShuffle(2))
+
+              def forward(self, x, flow, scale):
+                  x = F.interpolate(x, scale_factor=1.0 / scale, mode="bilinear", align_corners=False)
+                  if flow is not None:
+                      flow = F.interpolate(flow, scale_factor=1.0 / scale, mode="bilinear", align_corners=False) * (1.0 / scale)
+                      x = torch.cat((x, flow), 1)
+                  feat = self.convblock(self.conv0(x))
+                  tmp = self.lastconv(feat)
+                  tmp = F.interpolate(tmp, scale_factor=scale, mode="bilinear", align_corners=False)
+                  return tmp[:, :4] * scale, tmp[:, 4:5], tmp[:, 5:]
+
+
+          class IFNet(nn.Module):
+              """RIFE 4.25 (Practical-RIFE). Forward reescrito con el tamano fijo (h, w)."""
+
+              def __init__(self, h, w):
+                  super().__init__()
+                  self.block0 = IFBlock(7 + 8, 192)
+                  self.block1 = IFBlock(8 + 4 + 8 + 8, 128)
+                  self.block2 = IFBlock(8 + 4 + 8 + 8, 96)
+                  self.block3 = IFBlock(8 + 4 + 8 + 8, 64)
+                  self.block4 = IFBlock(8 + 4 + 8 + 8, 32)
+                  self.encode = Head()
+                  self.h, self.w = h, w
+                  gx = torch.from_numpy(np.linspace(-1.0, 1.0, w, dtype=np.float32)).view(1, 1, 1, w).expand(1, 1, h, w)
+                  gy = torch.from_numpy(np.linspace(-1.0, 1.0, h, dtype=np.float32)).view(1, 1, h, 1).expand(1, 1, h, w)
+                  self.register_buffer("base_grid", torch.cat([gx, gy], 1).contiguous(), persistent=False)
+
+              def warp(self, img, flow):
+                  fx = flow[:, 0:1] / ((self.w - 1.0) / 2.0)
+                  fy = flow[:, 1:2] / ((self.h - 1.0) / 2.0)
+                  grid = (self.base_grid + torch.cat([fx, fy], 1)).permute(0, 2, 3, 1)
+                  return F.grid_sample(img, grid, mode="bilinear", padding_mode="border", align_corners=True)
+
+              def forward(self, img0, img1, t):
+                  timestep = t.repeat(1, 1, self.h, self.w)
+                  f0 = self.encode(img0)
+                  f1 = self.encode(img1)
+                  blocks = [self.block0, self.block1, self.block2, self.block3, self.block4]
+                  scales = [16, 8, 4, 2, 1]
+                  flow = None
+                  mask = None
+                  feat = None
+                  warped0, warped1 = img0, img1
+                  for i in range(5):
+                      if flow is None:
+                          flow, mask, feat = blocks[i](torch.cat((img0, img1, f0, f1, timestep), 1), None, scales[i])
+                      else:
+                          wf0 = self.warp(f0, flow[:, :2])
+                          wf1 = self.warp(f1, flow[:, 2:4])
+                          fd, mask, feat = blocks[i](
+                              torch.cat((warped0, warped1, wf0, wf1, timestep, mask, feat), 1), flow, scales[i]
+                          )
+                          flow = flow + fd
+                      warped0 = self.warp(img0, flow[:, :2])
+                      warped1 = self.warp(img1, flow[:, 2:4])
+                  mask = torch.sigmoid(mask)
+                  return warped0 * mask + warped1 * (1 - mask)
+
+
+          class Wrapper(nn.Module):
+              def __init__(self, net):
+                  super().__init__()
+                  self.net = net
+
+              def forward(self, img0, img1, t):
+                  return self.net(img0, img1, t).clamp(0.0, 1.0)
+
+
+          def load_weights(model, path):
+              state = torch.load(path, map_location="cpu", weights_only=True)
+              if isinstance(state, dict) and "state_dict" in state:
+                  state = state["state_dict"]
+              state = {(k[7:] if k.startswith("module.") else k): v for k, v in state.items()}
+              missing, unexpected = model.load_state_dict(state, strict=False)
+              print("claves que faltan:", missing)
+              print("claves sobrantes:", unexpected)
+              if missing:
+                  sys.exit("ERROR: la arquitectura no coincide con los pesos (faltan claves).")
+              total = sum(p.numel() for p in model.parameters())
+              print("parametros:", total, "(esperado ~5.66 M)")
+
+
+          def make_pair(h, w, shift=16):
+              rng = np.random.RandomState(0)
+              yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+              base = np.zeros((h, w, 3), np.float32)
+              for c in range(3):
+                  for _ in range(12):
+                      fx, fy = rng.uniform(0.002, 0.03, 2)
+                      ph = rng.uniform(0, 6.28)
+                      base[..., c] += np.sin(2 * np.pi * (fx * xx + fy * yy) + ph)
+              base = (base - base.min()) / (base.max() - base.min())
+              for _ in range(25):
+                  x0 = rng.randint(0, w - 80)
+                  y0 = rng.randint(0, h - 80)
+                  base[y0:y0 + rng.randint(20, 80), x0:x0 + rng.randint(20, 80)] = rng.uniform(0, 1, 3)
+
+              def to_t(a):
+                  return torch.from_numpy(np.ascontiguousarray(a.transpose(2, 0, 1)[None].astype(np.float32)))
+
+              return to_t(base), to_t(np.roll(base, shift, axis=1)), to_t(np.roll(base, shift // 2, axis=1))
+
+
+          def mae(a, b, m=64):
+              return float(np.abs(a[..., m:-m, m:-m] - b[..., m:-m, m:-m]).mean())
+
+
+          def convert(net, h, w, precision, path):
+              wrapper = Wrapper(net).eval()
+              example = (torch.zeros(1, 3, h, w), torch.zeros(1, 3, h, w), torch.full((1, 1, 1, 1), 0.5))
+              with torch.no_grad():
+                  traced = torch.jit.trace(wrapper, example, check_trace=False)
+              model = ct.convert(
+                  traced,
+                  inputs=[
+                      ct.TensorType(name="img0", shape=(1, 3, h, w), dtype=np.float32),
+                      ct.TensorType(name="img1", shape=(1, 3, h, w), dtype=np.float32),
+                      ct.TensorType(name="t", shape=(1, 1, 1, 1), dtype=np.float32),
+                  ],
+                  outputs=[ct.TensorType(name="mid", dtype=np.float32)],
+                  convert_to="mlprogram",
+                  minimum_deployment_target=ct.target.iOS17,
+                  compute_precision=precision,
+              )
+              model.short_description = "RIFE 4.25 (Practical-RIFE, MIT) - interpolacion de frames. Entradas RGB 0..1 [1,3,H,W] y t en [0,1]."
+              model.save(path)
+
+
+          def predict(path, img0, img1, t, units):
+              model = ct.models.MLModel(path, compute_units=units)
+              start = time.time()
+              out = model.predict({"img0": img0.numpy(), "img1": img1.numpy(), "t": np.full((1, 1, 1, 1), t, np.float32)})
+              return np.array(out["mid"]), time.time() - start
+
+
+          def main():
+              sizes = [tuple(int(v) for v in s.lower().split("x")) for s in os.environ["SIZES"].split(",") if s.strip()]
+              weights = os.environ["WEIGHTS"]
+              os.makedirs("out", exist_ok=True)
+              summary = []
+              for (w, h) in sizes:
+                  assert w % 128 == 0 and h % 128 == 0, "El tamano debe ser multiplo de 128"
+                  print("\n========== %dx%d ==========" % (w, h))
+                  net = IFNet(h, w).eval()
+                  load_weights(net, weights)
+                  img0, img1, truth = make_pair(h, w)
+                  with torch.no_grad():
+                      ref = net(img0, img1, torch.full((1, 1, 1, 1), 0.5)).clamp(0, 1).numpy()
+                      ref25 = net(img0, img1, torch.full((1, 1, 1, 1), 0.25)).clamp(0, 1).numpy()
+                  blend = ((img0 + img1) / 2).numpy()
+                  entry = {
+                      "size": "%dx%d" % (w, h),
+                      "mae_pytorch_vs_verdad": mae(ref, truth.numpy()),
+                      "mae_mezcla_simple_vs_verdad": mae(blend, truth.numpy()),
+                  }
+                  print("PRUEBA DE SENTIDO: MAE RIFE (PyTorch) = %.5f | MAE mezcla simple = %.5f (RIFE debe ser menor)"
+                        % (entry["mae_pytorch_vs_verdad"], entry["mae_mezcla_simple_vs_verdad"]))
+                  for name, precision in (("fp32", ct.precision.FLOAT32), ("fp16", ct.precision.FLOAT16)):
+                      path = "out/RIFE_425_%s_%dx%d.mlpackage" % (name, w, h)
+                      print("\n--- convirtiendo %s ---" % name)
+                      convert(net, h, w, precision, path)
+                      out, secs = predict(path, img0, img1, 0.5, ct.ComputeUnit.CPU_ONLY)
+                      diff = np.abs(out - ref)
+                      entry[name] = {
+                          "max_diff_vs_pytorch": float(diff.max()),
+                          "mean_diff_vs_pytorch": float(diff.mean()),
+                          "mae_vs_verdad": mae(out, truth.numpy()),
+                          "segundos_cpu": round(secs, 2),
+                      }
+                      if name == "fp32":
+                          out25, _ = predict(path, img0, img1, 0.25, ct.ComputeUnit.CPU_ONLY)
+                          entry["fp32"]["max_diff_t0.25"] = float(np.abs(out25 - ref25).max())
+                      print(name, json.dumps(entry[name]))
+                      shutil.make_archive(path, "zip", root_dir="out", base_dir=os.path.basename(path))
+                  summary.append(entry)
+              with open("out/summary.json", "w") as handle:
+                  json.dump(summary, handle, indent=2)
+              print("\nRESUMEN:\n" + json.dumps(summary, indent=2))
+
+
+          main()
+          PYEOF
+
+      - name: Convert to Core ML (fp32 and fp16) and verify
+        env:
+          SIZES: ${{ inputs.sizes }}
+        run: |
+          set -o pipefail
+          mkdir -p out
+          python convert_rife.py 2>&1 | tee out/conversion-log.txt
+
+      - name: Publish models to a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd out
+          ls -lh
+          gh release view rife-models --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create rife-models --repo "$GITHUB_REPOSITORY" \
+              --title "RIFE 4.25 Core ML" \
+              --notes "RIFE 4.25 convertido a Core ML (MIT, hzwer/Practical-RIFE)."
+          gh release upload rife-models --repo "$GITHUB_REPOSITORY" --clobber ./*.zip
+
+      - name: Upload log and models as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rife-coreml
+          path: |
+            out/conversion-log.txt
+            out/summary.json
+            out/*.zip
+          if-no-files-found: warn
