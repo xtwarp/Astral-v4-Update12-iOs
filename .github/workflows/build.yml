@@ -121,6 +121,42 @@ jobs:
           fi
           ls -d "$OUT"/RIFE_*.mlpackage
 
+      - name: Download background-removal model (RMBG-1.4)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+          OUT="RealESRGANVideoUpscaler/Resources"
+          mkdir -p "$OUT"
+          rm -rf rmbg_tmp rmbg_venv
+          python3 -m venv rmbg_venv
+          . rmbg_venv/bin/activate
+          pip install --quiet huggingface_hub
+
+          ok=0
+          for attempt in 1 2 3 4; do
+            if python - <<'PY'
+          from huggingface_hub import snapshot_download
+          snapshot_download(
+              repo_id="mlboydaisuke/RMBG-1.4-CoreML",
+              revision="4d66dc450dfe49c25e0608e9810e06f49e839e19",
+              allow_patterns=["RMBG_1_4.mlpackage/*"],
+              local_dir="rmbg_tmp",
+          )
+          PY
+            then ok=1; break; fi
+            echo "Intento $attempt falló; reintentando en $((attempt * 15))s..."
+            sleep $((attempt * 15))
+          done
+          deactivate || true
+          [ "$ok" -eq 1 ] || { echo "ERROR: no se pudo descargar RMBG-1.4"; exit 1; }
+
+          test -f rmbg_tmp/RMBG_1_4.mlpackage/Manifest.json
+          rm -rf "$OUT/RMBG_1_4.mlpackage"
+          mv rmbg_tmp/RMBG_1_4.mlpackage "$OUT/RMBG_1_4.mlpackage"
+          rm -rf rmbg_tmp rmbg_venv
+          du -sh "$OUT/RMBG_1_4.mlpackage"
+
       - name: Verify project and models
         shell: bash
         run: |
@@ -274,6 +310,8 @@ jobs:
             done
           done
           find "$APP" -maxdepth 1 -iname 'RIFE_*.mlmodelc' -print
+          test -d "$APP/RMBG_1_4.mlmodelc" || { echo "ERROR: falta RMBG_1_4.mlmodelc en la app"; exit 1; }
+          echo "RMBG-1.4 incluido en la app"
 
           echo "===== Info.plist de la app compilada ====="
           /usr/libexec/PlistBuddy -c "Print" "$APP/Info.plist" | head -60
