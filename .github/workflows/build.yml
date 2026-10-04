@@ -73,6 +73,38 @@ jobs:
           chmod +x scripts_download_model.sh
           ./scripts_download_model.sh
 
+      - name: Download extra upscaling models (Nova, Quasar)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+          OUT="RealESRGANVideoUpscaler/Resources"
+          mkdir -p "$OUT" sr_tmp
+
+          if ! gh release view sr-models --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "ERROR: no existe el release 'sr-models' en este repositorio."
+            echo "Corre primero el workflow 'Convert SR models (Nova + Quasar) to Core ML' y luego este."
+            exit 1
+          fi
+
+          gh release download sr-models --repo "$GITHUB_REPOSITORY" \
+            --pattern 'RealESRGAN_*_522_fp16.zip' --dir sr_tmp --clobber
+
+          for z in sr_tmp/*.zip; do
+            unzip -oq "$z" -d "$OUT"
+          done
+          rm -rf sr_tmp
+
+          for id in hfa2k_compact animerd; do
+            if [ ! -d "$OUT/RealESRGAN_${id}_522_fp16.mlpackage" ]; then
+              echo "ERROR: falta RealESRGAN_${id}_522_fp16.mlpackage en el release sr-models"
+              exit 1
+            fi
+          done
+          ls -d "$OUT"/RealESRGAN_*.mlpackage
+
       - name: Download RIFE interpolation models
         shell: bash
         env:
@@ -134,7 +166,7 @@ jobs:
           find RealESRGANVideoUpscaler -type f -name '*.swift' -print
 
           echo "===== models ====="
-          for model in animevideo general anime_6B x4plus; do
+          for model in animevideo general anime_6B x4plus hfa2k_compact animerd; do
             test -d "RealESRGANVideoUpscaler/Resources/RealESRGAN_${model}_522_fp16.mlpackage"
           done
 
@@ -262,7 +294,7 @@ jobs:
           test -n "$APP"
           echo "APP=$PWD/$APP" >> "$GITHUB_ENV"
 
-          for model in animevideo general anime_6B x4plus; do
+          for model in animevideo general anime_6B x4plus hfa2k_compact animerd; do
             test -d "$APP/RealESRGAN_${model}_522_fp16.mlmodelc"
           done
 
