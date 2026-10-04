@@ -27,7 +27,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -f project.yml ] && [ -d RealESRGANVideoUpscaler ]; then
+          if [ -f project.yml ] && [ -d Astral ]; then
             PROJECT_ROOT="$PWD"
             echo "Proyecto en la raíz del repositorio"
           else
@@ -80,7 +80,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$PROJECT_ROOT"
-          OUT="RealESRGANVideoUpscaler/Resources"
+          OUT="Astral/Resources"
           mkdir -p "$OUT" sr_tmp
 
           if ! gh release view sr-models --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -112,7 +112,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$PROJECT_ROOT"
-          OUT="RealESRGANVideoUpscaler/Resources"
+          OUT="Astral/Resources"
           mkdir -p "$OUT" rife_tmp/x
 
           if ! gh release view rife-models --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -162,18 +162,38 @@ jobs:
           echo "===== project.yml ====="
           cat project.yml
 
+          echo "===== Diagnóstico ====="
+          echo "PROJECT_ROOT=$PWD"
+          ls -la
+          echo "--- Astral/ ---"
+          ls -la Astral || true
+          echo "--- Astral/Resources ---"
+          ls -la Astral/Resources || true
+
           echo "===== Swift files ====="
-          find RealESRGANVideoUpscaler -type f -name '*.swift' -print
+          SWIFT_COUNT="$(find Astral -type f -name '*.swift' | wc -l | tr -d ' ')"
+          find Astral -type f -name '*.swift' -print
+          if [ "$SWIFT_COUNT" -eq 0 ]; then
+            echo "ERROR: no hay archivos .swift dentro de Astral/ (¿se subió la carpeta Astral completa y se borró RealESRGANVideoUpscaler?)"
+            exit 1
+          fi
 
           echo "===== models ====="
+          MISSING_MODELS=0
           for model in animevideo general anime_6B x4plus hfa2k_compact animerd; do
-            test -d "RealESRGANVideoUpscaler/Resources/RealESRGAN_${model}_522_fp16.mlpackage"
+            if [ -d "Astral/Resources/RealESRGAN_${model}_522_fp16.mlpackage" ]; then
+              echo "OK: $model"
+            else
+              echo "FALTA: RealESRGAN_${model}_522_fp16.mlpackage"
+              MISSING_MODELS=1
+            fi
           done
+          if [ "$MISSING_MODELS" -ne 0 ]; then exit 1; fi
 
           echo "===== modelos RIFE ====="
           for precision in fp16 fp32; do
             for orientation in Landscape Portrait; do
-              test -d "RealESRGANVideoUpscaler/Resources/RIFE_${precision}_${orientation}.mlpackage"
+              test -d "Astral/Resources/RIFE_${precision}_${orientation}.mlpackage"
             done
           done
 
@@ -220,7 +240,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$PROJECT_ROOT"
-          rm -rf RealESRGANVideoUpscaler.xcodeproj
+          rm -rf Astral.xcodeproj
           xcodegen generate
           XCODEPROJ="$(find . -maxdepth 2 -type d -name '*.xcodeproj' | head -1)"
           test -n "$XCODEPROJ"
@@ -236,7 +256,7 @@ jobs:
 
           xcodebuild \
             -project "$XCODEPROJ" \
-            -scheme RealESRGANVideoUpscaler \
+            -scheme Astral \
             -sdk iphoneos \
             -configuration Release \
             -destination generic/platform=iOS \
@@ -290,7 +310,7 @@ jobs:
           set -euo pipefail
           cd "$PROJECT_ROOT"
 
-          APP="$(find build -type d -name 'RealESRGANVideoUpscaler.app' | head -1)"
+          APP="$(find build -type d -name 'Astral.app' | head -1)"
           test -n "$APP"
           echo "APP=$PWD/$APP" >> "$GITHUB_ENV"
 
