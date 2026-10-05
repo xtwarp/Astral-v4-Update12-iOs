@@ -209,13 +209,8 @@ jobs:
           set -euo pipefail
           cd "$PROJECT_ROOT"
 
-          VVM="$(find . -type f -name VideoViewModel.swift | head -1)"
           VP="$(find . -type f -name VideoProcessor.swift | head -1)"
-          test -n "$VVM"
           test -n "$VP"
-
-          # Remove the @MainActor-incompatible deinit block if it exists.
-          sed -i '' '/^    deinit {$/,/^    }$/d' "$VVM" || true
 
           # CoreFoundation cast used by the current Swift/Xcode toolchain.
           sed -i '' \
