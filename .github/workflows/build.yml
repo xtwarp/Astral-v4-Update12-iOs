@@ -336,20 +336,27 @@ jobs:
           set -euo pipefail
           cd "$PROJECT_ROOT"
 
+          # El nombre sale de la versión de project.yml (CFBundleShortVersionString) y del número de ejecución.
+          VERSION="$(awk -F'"' '/CFBundleShortVersionString/ {print $2; exit}' project.yml)"
+          VERSION="${VERSION:-sin-version}"
+          IPA_NAME="Astral-v${VERSION}-build${GITHUB_RUN_NUMBER}.ipa"
+          echo "IPA_NAME=$IPA_NAME" >> "$GITHUB_ENV"
+          echo "IPA_ARTIFACT=Astral-v${VERSION}-IPA" >> "$GITHUB_ENV"
+
           rm -rf artifact
           mkdir -p artifact/Payload
           cp -R "$APP" artifact/Payload/
 
           cd artifact
-          zip -qry Astral-v0.4-BUILD-RUN.ipa Payload
-          test -s Astral-v0.4-BUILD-RUN.ipa
-          unzip -t Astral-v0.4-BUILD-RUN.ipa
-          ls -lh Astral-v0.4-BUILD-RUN.ipa
+          zip -qry "$IPA_NAME" Payload
+          test -s "$IPA_NAME"
+          unzip -t "$IPA_NAME"
+          ls -lh "$IPA_NAME"
 
       - name: Upload Astral IPA
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Astral-v0.4-IPA
-          path: ${{ env.PROJECT_ROOT }}/artifact/Astral-v0.4-BUILD-RUN.ipa
+          name: ${{ env.IPA_ARTIFACT }}
+          path: ${{ env.PROJECT_ROOT }}/artifact/${{ env.IPA_NAME }}
           if-no-files-found: error
